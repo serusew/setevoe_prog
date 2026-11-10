@@ -1,0 +1,278 @@
+import net from 'node:net';
+import dgram from 'node:dgram';
+import dns from 'node:dns/promises';
+import os from 'node:os';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execAsync = promisify(exec);
+
+const HOST = '127.0.0.1';
+const PORT = 3000;
+const UDP_PORT = 3001;
+
+function runTcpServer(bindHost = HOST) {
+  const server = net.createServer((socket) => {
+    const id = `${socket.remoteAddress}:${socket.remotePort}`;
+    console.log(`[tcp] клиент подключён: ${id}`);
+
+    socket.on('data', (chunk) => {
+      const text = chunk.toString('utf8').trim();
+      console.log(`[tcp] ${id} → ${JSON.stringify(text)}`);
+
+      if (text === 'PING') {
+        socket.write('PONG\n');
+      } else if (text === 'INFO') {
+        socket.write(`HOST ${os.hostname()}\n`);
+        socket.write(`PLATFORM ${process.platform}\n`);
+        socket.write(`NODE ${process.version}\n`);
+      } else if (text === 'QUIT') {
+        socket.end('BYE\n');
+      } else {
+        socket.write(`ECHO: ${text}\n`);
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.error(`[tcp] ошибка ${id}:`, err.message);
+    });
+
+    socket.on('close', () => {
+      console.log(`[tcp] клиент отключён: ${id}`);
+    });
+  });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `[tcp] порт ${PORT} уже занят. ` +
+        `Скорее всего, сервер уже запущен в другом терминале.`
+      );
+    } else {
+      console.error('[tcp] ошибка сервера:', err.message);
+    }
+    process.exit(1);
+  });
+
+  server.listen(PORT, bindHost, () => {
+    const addr = server.address();
+    console.log(`[tcp] сервер слушает ${addr.address}:${addr.port}`);
+    if (bindHost === '0.0.0.0') {
+      console.log('[tcp] доступен по всем IPv4-интерфейсам этой машины');
+      console.log('[tcp] локальные адреса:');
+      for (const [name, list] of Object.entries(os.networkInterfaces())) {
+        for (const item of list) {
+          if (item.family === 'IPv4' && !item.internal) {
+            console.log(`       ${name}: ${item.address}`);
+          }
+        }
+      }
+    }
+    console.log('[tcp] команды: PING | INFO | QUIT | <любой текст>');
+  });
+
+  process.on('SIGINT', () => {
+    console.log('\n[tcp] завершение...');
+    server.close(() => process.exit(0));
+  });
+}
+
+function runTcpClient(host = HOST) {
+  const socket = net.createConnection({ host, port: PORT });
+  socket.setEncoding('utf8');
+
+  let buffer = '';
+  let step = 0;
+
+  const commands = ['PING', 'INFO', 'Привет, сервер', 'QUIT'];
+
+  socket.on('connect', () => {
+    console.log(`[client] подключено к ${host}:${PORT}`);
+    sendNext();
+  });
+
+  function sendNext() {
+    if (step >= commands.length) return;
+    const cmd = commands[step++];
+    console.log(`[client] → ${JSON.stringify(cmd)}`);
+    socket.write(cmd + '\n');
+  }
+
+  socket.on('data', (chunk) => {
+    buffer += chunk;
+
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      console.log(`[client] ← ${JSON.stringify(line)}`);
+
+      if (line === 'BYE') {
+        socket.end();
+        return;
+      }
+      sendNext();
+    }
+  });
+
+  socket.on('error', (err) => {
+    console.error(`[client] ошибка: ${err.message}`);
+  });
+
+  socket.on('close', () => {
+    console.log('[client] соединение закрыто');
+  });
+}
+
+function runUdpServer() {
+  const server = dgram.createSocket('udp4');
+
+  server.on('error', (err) => {
+    console.error(`[udp] ошибка: ${err.message}`);
+    server.close();
+  });
+
+  server.on('message', (msg, rinfo) => {
+    const text = msg.toString('utf8');
+    console.log(`[udp] ${rinfo.address}:${rinfo.port} → ${JSON.stringify(text)}`);
+
+    const reply = Buffer.from(`UDP-ECHO: ${text}`);
+    server.send(reply, rinfo.port, rinfo.address, (err) => {
+      if (err) console.error('[udp] ошибка отправки:', err.message);
+    });
+  });
+
+  server.on('listening', () => {
+    const addr = server.address();
+    console.log(`[udp] сервер слушает ${addr.address}:${addr.port}`);
+  });
+
+  server.bind(UDP_PORT, HOST);
+}
+
+async function runUdpClient() {
+  const client = dgram.createSocket('udp4');
+
+  const messages = ['hello', 'датаграмма 2', 'последняя'];
+  let received = 0;
+
+  client.on('message', (msg, rinfo) => {
+    console.log(`[udp-client] ← ${rinfo.address}:${rinfo.port} ${msg.toString('utf8')}`);
+    received++;
+    if (received === messages.length) {
+      client.close();
+    }
+  });
+
+  client.on('error', (err) => {
+    console.error('[udp-client] ошибка:', err.message);
+    client.close();
+  });
+
+  for (const m of messages) {
+    const buf = Buffer.from(m, 'utf8');
+    await new Promise((resolve, reject) => {
+      client.send(buf, UDP_PORT, HOST, (err) => {
+        if (err) return reject(err);
+        console.log(`[udp-client] → ${JSON.stringify(m)}`);
+        resolve();
+      });
+    });
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  setTimeout(() => {
+    if (received < messages.length) {
+      console.warn(`[udp-client] получено ${received}/${messages.length} (UDP без гарантий)`);
+      client.close();
+    }
+  }, 1500);
+}
+
+async function runDns(name) {
+  if (!name) {
+    console.error('Использование: node app.mjs dns nodejs.org');
+    process.exit(1);
+  }
+
+  try {
+    const result = await dns.lookup(name, { all: true });
+    console.log(`[dns] ${name} →`);
+    for (const r of result) {
+      console.log(`       ${r.address} (IPv${r.family})`);
+    }
+  } catch (err) {
+    console.error(`[dns] ошибка: ${err.message}`);
+  }
+}
+
+async function runDiag() {
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const item of list) {
+      if (item.family === 'IPv4') {
+        console.log(`  ${name}: ${item.address}${item.internal ? ' (внутренний)' : ''}`);
+      }
+    }
+  }
+
+  try {
+    const { stdout } = await execAsync('ping -n 1 127.0.0.1');
+    console.log(stdout.split('\n').slice(0, 4).join('\n'));
+  } catch {
+    console.log('  ping недоступен в этой среде — это нормально');
+  }
+
+  try {
+    const r = await dns.lookup('nodejs.org', { all: true });
+    console.log('  nodejs.org →', r.map((x) => x.address).join(', '));
+  } catch (err) {
+    console.log('  DNS-ошибка:', err.message);
+  }
+
+  try {
+    const { stdout } = await execAsync('netstat -ano');
+    const lines = stdout.split('\n').filter((l) => /LISTENING/i.test(l));
+    for (const line of lines.slice(0, 5)) {
+      console.log('  ' + line.trim());
+    }
+    console.log(`  всего LISTENING: ${lines.length}`);
+  } catch (err) {
+    console.log('  netstat недоступен:', err.message);
+  }
+}
+
+const [,, mode, arg] = process.argv;
+
+switch (mode) {
+  case 'server':
+    runTcpServer(HOST);
+    break;
+  case 'server-any':
+    runTcpServer('0.0.0.0');
+    break;
+  case 'client':
+    runTcpClient(arg || HOST);
+    break;
+  case 'udp-server':
+    runUdpServer();
+    break;
+  case 'udp-client':
+    runUdpClient();
+    break;
+  case 'dns':
+    runDns(arg);
+    break;
+  case 'diag':
+    runDiag();
+    break;
+  default:
+    console.log('Использование:');
+    console.log('  node app.mjs server');
+    console.log('  node app.mjs server-any');
+    console.log('  node app.mjs client [host]');
+    console.log('  node app.mjs udp-server');
+    console.log('  node app.mjs udp-client');
+    console.log('  node app.mjs dns <name>');
+    console.log('  node app.mjs diag');
+    process.exit(1);
+}
