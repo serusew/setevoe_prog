@@ -1,0 +1,224 @@
+import net from 'node:net';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execAsync = promisify(exec);
+
+const HOST = '127.0.0.1';
+const PORT = 3001;
+const DEFAULT_TIMEOUT = 10000;
+
+function runServer(timeoutMs = DEFAULT_TIMEOUT) {
+  const server = net.createServer((socket) => {
+    const id = `${socket.remoteAddress}:${socket.remotePort}`;
+    const local = `${socket.localAddress}:${socket.localPort}`;
+
+    console.log(`[server] + подключение ${id} → ${local}`);
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => {
+      console.log(`[server] TIMEOUT: ${id} молчит ${timeoutMs} мс`);
+      socket.end('TIMEOUT\n');
+    });
+
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      let idx;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (line) handleCommand(socket, id, line);
+      }
+    });
+
+    socket.on('end', () => {
+      console.log(`[server] END: ${id} больше не отправляет данные`);
+    });
+
+    socket.on('close', (hadError) => {
+      console.log(`[server] CLOSE: ${id} (hadError=${hadError})`);
+    });
+
+    socket.on('error', (err) => {
+      console.log(`[server] ERROR: ${id} ${err.code || err.message}`);
+    });
+  });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `[server] EADDRINUSE: порт ${PORT} уже занят. ` +
+        `Остановите другой сервер или используйте другой порт.`
+      );
+    } else {
+      console.error(`[server] server error: ${err.code} ${err.message}`);
+    }
+    process.exit(1);
+  });
+
+  server.listen(PORT, HOST, () => {
+    const a = server.address();
+    console.log(`[server] слушает ${a.address}:${a.port}, тайм-аут ${timeoutMs} мс`);
+    console.log('[server] команды: PING | TIME | BYE | CRASH');
+  });
+
+  process.on('SIGINT', () => {
+    console.log('\n[server] завершение...');
+    server.close(() => process.exit(0));
+  });
+}
+
+function handleCommand(socket, id, line) {
+  console.log(`[server] ${id} → ${JSON.stringify(line)}`);
+
+  switch (line.toUpperCase()) {
+    case 'PING':
+      socket.write('PONG\n');
+      break;
+
+    case 'TIME':
+      socket.write(`TIME ${new Date().toISOString()}\n`);
+      break;
+
+    case 'BYE':
+      socket.end('BYE\n');
+      break;
+
+    case 'CRASH':
+      console.log(`[server] destroy() для ${id}`);
+      socket.destroy();
+      break;
+
+    default:
+      socket.write(`ECHO: ${line}\n`);
+  }
+}
+
+function runClient(mode = 'normal') {
+  if (mode === 'refused') {
+    return runClientRefused();
+  }
+
+  const socket = net.createConnection({ host: HOST, port: PORT });
+  socket.setEncoding('utf8');
+
+  console.log(`[client] режим: ${mode}`);
+
+  socket.on('connect', () => {
+    console.log('[client] CONNECT: соединение установлено');
+    console.log(
+      `[client] local=${socket.localAddress}:${socket.localPort} ` +
+      `remote=${socket.remoteAddress}:${socket.remotePort}`
+    );
+
+    if (mode === 'idle') {
+      console.log('[client] ничего не отправляем — ждём TIMEOUT от сервера');
+      return;
+    }
+
+    if (mode === 'reset') {
+      console.log('[client] отправляем PING, затем destroy() через 500 мс');
+      socket.write('PING\n');
+      setTimeout(() => {
+        console.log('[client] destroy(): аварийный разрыв');
+        socket.destroy();
+      }, 500);
+      return;
+    }
+
+    const commands = ['PING', 'TIME', 'BYE'];
+    let step = 0;
+    const sendNext = () => {
+      if (step >= commands.length) return;
+      const cmd = commands[step++];
+      console.log(`[client] → ${cmd}`);
+      socket.write(cmd + '\n');
+    };
+    sendNext();
+
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      let idx;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        console.log(`[client] ← ${JSON.stringify(line)}`);
+        if (line === 'BYE') return;
+        sendNext();
+      }
+    });
+  });
+
+  socket.on('end', () => {
+    console.log('[client] END: сервер закончил отправку');
+  });
+
+  socket.on('close', (hadError) => {
+    console.log(`[client] CLOSE (hadError=${hadError})`);
+  });
+
+  socket.on('error', (err) => {
+    console.log(`[client] ERROR: ${err.code || err.message}`);
+  });
+  socket.setTimeout(DEFAULT_TIMEOUT + 2000);
+  socket.on('timeout', () => {
+    console.log('[client] TIMEOUT: нет активности, закрываем');
+    socket.end();
+  });
+}
+
+function runClientRefused() {
+  const socket = net.createConnection({ host: HOST, port: PORT + 100 });
+
+  socket.on('connect', () => {
+    console.log('[client] неожиданно подключились (порт всё-таки открыт?)');
+  });
+
+  socket.on('error', (err) => {
+    console.log(`[client] ERROR: ${err.code} — ${err.message}`);
+    if (err.code  'ECONNREFUSED') {
+      console.log('[client] на этом адресе/порту никто не принимает подключения');
+    }
+  });
+
+  socket.on('close', (hadError) => {
+    console.log(`[client] CLOSE (hadError=${hadError})`);
+  });
+}
+
+async function runNetstat() {
+  try {
+    const { stdout } = await execAsync('netstat -ano');
+    const lines = stdout.split('\n').filter((l) => l.includes(`:${PORT}`));
+    if (lines.length === 0) {
+      console.log(`[netstat] записей для порта ${PORT} нет`);
+      return;
+    }
+    console.log(`[netstat] записи для порта ${PORT}:`);
+    for (const line of lines) console.log('  ' + line.trim());
+  } catch (err) {
+    console.log('[netstat] недоступен:', err.message);
+  }
+}
+
+const [,, mode, arg] = process.argv;
+
+switch (mode) {
+  case 'server':
+    runServer(Number(arg) || DEFAULT_TIMEOUT);
+    break;
+  case 'client':
+    runClient(arg || 'normal');
+    break;
+  case 'netstat':
+    runNetstat();
+    break;
+  default:
+    console.log('Использование:');
+    console.log('  node app.mjs server [timeoutMs]');
+    console.log('  node app.mjs client [normal|idle|reset|refused]');
+    console.log('  node app.mjs netstat');
+    process.exit(1);
+}
