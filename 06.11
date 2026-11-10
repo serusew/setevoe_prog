@@ -1,0 +1,274 @@
+import net from 'node:net';
+
+const HOST = '127.0.0.1';
+const PORT = 3002;
+
+const MAX_LINE_BYTES = 2048;
+const MAX_PAYLOAD_BYTES = 64 * 1024;
+
+function runOrder() {
+  console.log('1. Синхронный код');
+
+  setTimeout(() => {
+    console.log('4. Таймер (setTimeout 0)');
+  }, 0);
+
+  Promise.resolve().then(() => {
+    console.log('3. Promise (микрозадача)');
+  });
+
+  process.nextTick(() => {
+    console.log('2.5. process.nextTick');
+  });
+
+  console.log('2. Синхронный код');
+}
+
+function runBlocking() {
+  const start = Date.now();
+
+  setTimeout(() => {
+    console.log('[blocking] таймер запустился через', Date.now() - start, 'мс');
+  }, 100);
+  while (Date.now() - start < 2000) {
+  }
+
+  console.log('[blocking] синхронная работа завершена через', Date.now() - start, 'мс');
+}
+
+function runServer() {
+  const server = net.createServer((socket) => {
+    const id = `${socket.remoteAddress}:${socket.remotePort}`;
+    console.log(`[server] клиент подключён: ${id}`);
+
+    let pending = Buffer.alloc(0);
+
+    socket.on('data', (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+
+
+        if (pending.length >= 4) {
+          const length = pending.readUInt32BE(0);
+
+          if (length > MAX_PAYLOAD_BYTES) {
+            socket.end('ERROR: слишком большое сообщение\n');
+            return;
+          }
+
+          if (pending.length >= 4 + length) {
+            const payload = pending.subarray(4, 4 + length);
+            pending = pending.subarray(4 + length);
+
+            const text = payload.toString('utf8');
+            handleCommand(socket, id, text);
+            continue;
+          }
+        }
+
+        const nl = pending.indexOf(0x0a);
+        if (nl !== -1) {
+          const lineBuf = pending.subarray(0, nl);
+          pending = pending.subarray(nl + 1);
+
+          if (lineBuf.length > MAX_LINE_BYTES) {
+            socket.end('ERROR: слишком длинная строка\n');
+            return;
+          }
+
+          const line = lineBuf.toString('utf8').trim();
+          if (line) handleCommand(socket, id, line);
+          continue;
+        }
+
+        break;
+      }
+
+      if (pending.length > MAX_LINE_BYTES + 4) {
+        socket.end('ERROR: превышен лимит буфера\n');
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.error(`[server] ошибка ${id}:`, err.message);
+    });
+
+    socket.on('close', () => {
+      console.log(`[server] клиент отключён: ${id}`);
+    });
+  });
+
+  server.on('error', (err) => {
+    console.error('[server] ошибка сервера:', err.message);
+  });
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[server] NetLab: ${HOST}:${PORT}`);
+    console.log('[server] команды: PING | TIME | ECHO <text> | BLOCK <ms> | BIG <n>');
+  });
+
+  process.on('SIGINT', () => {
+    console.log('\n[server] завершение...');
+    server.close(() => {
+      console.log('[server] сервер остановлен');
+      process.exit(0);
+    });
+  });
+}
+
+function handleCommand(socket, id, line) {
+  console.log(`[server] ${id} → ${JSON.stringify(line)}`);
+
+  const [cmd, ...rest] = line.split(' ');
+  const arg = rest.join(' ');
+
+  switch (cmd.toUpperCase()) {
+    case 'PING':
+      reply(socket, 'PONG');
+      break;
+
+    case 'TIME':
+      reply(socket, `TIME ${new Date().toISOString()}`);
+      break;
+
+    case 'ECHO':
+      reply(socket, `ACK: ${arg}`);
+      break;
+
+    case 'BLOCK': {
+      const ms = Math.min(Number(arg) || 1000, 5000);
+      setImmediate(() => {
+        const start = Date.now();
+        while (Date.now() - start < ms) {}
+        reply(socket, `BLOCKED ${ms}ms (main thread was busy)`);
+      });
+      break;
+    }
+
+    case 'BIG': {
+      const n = Math.min(Number(arg) || 1000, 100_000);
+      sendBig(socket, n);
+      break;
+    }
+
+    default:
+      reply(socket, `ERROR: неизвестная команда ${cmd}`);
+  }
+}
+
+function reply(socket, text) {
+  if (socket.destroyed) return;
+  const ok = socket.write(text + '\n');
+  if (!ok) {
+    console.log('[server] backpressure: ждём drain');
+    socket.once('drain', () => console.log('[server] drain: можно писать дальше'));
+  }
+}
+
+function sendBig(socket, count) {
+  let sent = 0;
+
+  const writeMore = () => {
+    while (sent < count) {
+      const line = `line ${++sent}\n`;
+      const ok = socket.write(line);
+
+      if (!ok) {
+        socket.once('drain', writeMore);
+        return;
+      }
+    }
+    socket.write(`DONE ${count}\n`);
+  };
+
+  writeMore();
+}
+
+function runClient(n = 1) {
+  const socket = net.createConnection({ host: HOST, port: PORT });
+  socket.setEncoding('utf8');
+
+  let buffer = '';
+  let expected = 0;
+  let received = 0;
+
+  const sendLine = (text) => {
+    socket.write(text + '\n');
+    expected++;
+  };
+
+  const sendLengthPrefixed = (text) => {
+    const payload = Buffer.from(text, 'utf8');
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(payload.length, 0);
+    socket.write(Buffer.concat([header, payload]));
+    expected++;
+  };
+
+  socket.on('connect', () => {
+    console.log(`[client ${n}] подключено`);
+
+    sendLine('PING');
+    sendLine('TIME');
+    socket.write('ECHO ');
+    socket.write(`Hello from client ${n}\n`);
+    expected++;
+    sendLine(`ECHO Привет от клиента ${n}`);
+    sendLengthPrefixed(`Многострочное\nсообщение от ${n}`);
+  });
+
+  socket.on('data', (chunk) => {
+    buffer += chunk;
+
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      console.log(`[client ${n}] ←`, JSON.stringify(line));
+      received++;
+
+      if (received  expected) {
+        console.log(`[client ${n}] все ответы получены`);
+        socket.end();
+      }
+    }
+  });
+
+  socket.on('error', (err) => {
+    console.error(`[client ${n}] ошибка:`, err.message);
+  });
+
+  socket.on('close', () => {
+    console.log(`[client ${n}] соединение закрыто`);
+  });
+
+  setTimeout(() => {
+    if (received < expected) {
+      console.warn(`[client ${n}] не дождались: ${received}/${expected}`);
+      socket.destroy();
+    }
+  }, 5000);
+}
+
+const [,, mode, arg] = process.argv;
+
+switch (mode) {
+  case 'order':
+    runOrder();
+    break;
+  case 'blocking':
+    runBlocking();
+    break;
+  case 'server':
+    runServer();
+    break;
+  case 'client':
+    runClient(Number(arg) || 1);
+    break;
+  default:
+    console.log('Использование:');
+    console.log('  node app.mjs order');
+    console.log('  node app.mjs blocking');
+    console.log('  node app.mjs server');
+    console.log('  node app.mjs client <N>');
+    process.exit(1);
+}
