@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebSocket · Эхо-сервер</title>
+<style>
+  * { box-sizing: border-box }
+  body { margin: 0; background: #f1f5f4; color: #183832; font: 16px/1.5 "Segoe UI", sans-serif }
+  main { max-width: 740px; margin: 6vh auto; padding: 24px }
+  h1 { font-size: clamp(32px, 6vw, 48px); margin: 0 }
+  section { margin-top: 24px; background: white; border: 1px solid #c7d5d0; border-radius: 12px; padding: 22px }
+  button, input { padding: 10px 14px; border-radius: 6px; border: 1px solid #839b92; font: inherit }
+  button { cursor: pointer; background: #225f50; color: white }
+  button:disabled { cursor: default; background: #e5ebe8; color: #53645e }
+  .row { display: flex; gap: 8px; flex-wrap: wrap }
+  input { flex: 1; min-width: 0 }
+  label { display: block; margin: 20px 0 6px }
+  h2 { margin: 0; font-size: 20px }
+  ol { margin-bottom: 0; padding-left: 2em; overflow-wrap: anywhere }
+  li { padding: 4px; white-space: pre-wrap }
+</style>
+<main>
+  <h1>Эхо-сервер</h1>
+  <p>Отправьте текст и проследите его путь до сервера и обратно.</p>
+  <section aria-label="Управление соединением">
+    <p id="status" role="status">Соединение закрыто</p>
+    <div class="row"><button id="connect">Подключиться</button><button id="close" disabled>Отключиться</button></div>
+    <form><label for="message">Сообщение</label><div class="row"><input id="message" value="PING" required><button id="send" disabled>Отправить</button></div></form>
+  </section>
+  <section><h2>Журнал обмена</h2><ol id="log" aria-live="polite"></ol></section>
+</main>
+<script type="module">
+  const get = id => document.getElementById(id);
+  let socket;
+  function log(text) {
+    const entry = document.createElement('li');
+    entry.textContent = text;
+    get('log').append(entry);
+  }
+  function refresh() {
+    const state = socket.readyState;
+    get('status').textContent = ['Подключение…', 'Соединение открыто', 'Завершение…', 'Соединение закрыто'][state];
+    get('connect').disabled = state !== WebSocket.CLOSED;
+    get('send').disabled = get('close').disabled = state !== WebSocket.OPEN;
+  }
+  get('connect').onclick = () => {
+    socket = new WebSocket('ws://' + location.host + '/ws');
+    refresh();
+    socket.onopen = () => { refresh(); log('OPEN'); };
+    socket.onmessage = event => log('Сервер → клиент: ' + event.data);
+    socket.onerror = () => log('ERROR · ошибка соединения');
+    socket.onclose = event => {
+      refresh();
+      log('CLOSE · ' + event.code + (event.reason ? ' · ' + event.reason : ''));
+    };
+  };
+  document.querySelector('form').onsubmit = event => {
+    event.preventDefault();
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const text = get('message').value;
+    if (new TextEncoder().encode(text).length > 2048) {
+      log('Сообщение превышает 2048 байт');
+      return;
+    }
+    socket.send(text);
+    log('Клиент → сервер: ' + text);
+  };
+  get('close').onclick = () => {
+    socket.close(1000, 'Практика завершена');
+    refresh();
+  };
+</script>
+</html>
